@@ -1,0 +1,114 @@
+name: Build dictionary data
+
+# Checks once a day whether the Digital Pāḷi Dictionary has a new release.
+# If it has, builds the PaliVerse data files from it and publishes them as a release here.
+
+on:
+  schedule:
+    - cron: "23 4 * * *" # every day at 04:23 UTC
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "DPD release tag to build (leave empty for the latest)"
+        required: false
+        default: ""
+      force:
+        description: "Build again even if this release is already published here"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  DPD_REPO: digitalpalidictionary/dpd-db
+  CST_REPO: https://github.com/VipassanaTech/tipitaka-xml
+  # The CST source texts are fixed to this commit. Change it only on purpose.
+  CST_COMMIT: 5dd67dbcac7a1f4416d5d00c00735f6c6bfb9e61
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Keep the schedule alive
+        # GitHub switches off scheduled jobs in a repository that has had no commit for 60 days.
+        run: |
+          LAST=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          if [ $(( (NOW - LAST) / 86400 )) -ge 30 ]; then
+            date -u +"%Y-%m-%d" > .last-check
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .last-check
+            git commit -q -m "Monthly check: the schedule is running"
+            git push -q
+          fi
+
+      - name: Find the DPD release to build
+        id: dpd
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          TAG="$TAG_INPUT"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api "repos/$DPD_REPO/releases/latest" --jq .tag_name)
+          fi
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            *) echo "Unexpected DPD tag: $TAG"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" >/dev/null 2>&1 && [ "$FORCE" != "true" ]; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "DPD $TAG is already published here. Nothing to do."
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+            echo "Building DPD $TAG."
+          fi
+
+      - name: Download the DPD database
+        if: steps.dpd.outputs.new == 'true'
+        run: |
+          gh release download "${{ steps.dpd.outputs.tag }}" -R "$DPD_REPO" -p "dpd.db.tar.xz"
+          tar -xf dpd.db.tar.xz
+          test -s dpd.db
+
+      - name: Get the CST source texts
+        if: steps.dpd.outputs.new == 'true'
+        run: |
+          git init -q cst
+          cd cst
+          git remote add origin "$CST_REPO"
+          git sparse-checkout set romn
+          git fetch -q --depth 1 --filter=blob:none origin "$CST_COMMIT"
+          git checkout -q FETCH_HEAD
+          test -d romn
+
+      - name: Build the data files
+        if: steps.dpd.outputs.new == 'true'
+        run: python3 build_all.py dpd.db cst/romn out
+
+      - name: Check the build against the previous release
+        if: steps.dpd.outputs.new == 'true'
+        run: |
+          mkdir -p prev
+          gh release download -p manifest.json -D prev 2>/dev/null || echo "No previous release to compare with."
+          python3 check_build.py out "${{ steps.dpd.outputs.tag }}" prev/manifest.json
+
+      - name: Publish the release
+        if: steps.dpd.outputs.new == 'true'
+        run: |
+          TAG="${{ steps.dpd.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" out/*.json --title "DPD $TAG" --notes-file out/notes.md
